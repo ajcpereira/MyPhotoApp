@@ -3,3 +3,4 @@ bin/
 .venv/
 __pycache__/
 analytics/media_index.db
+analytics/media_index.db-journal
