@@ -2,3 +2,4 @@ logs/
 bin/
 .venv/
 __pycache__/
+analytics/media_index.db

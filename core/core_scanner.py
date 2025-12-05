@@ -1,27 +1,25 @@
 import logging
-logger = logging.getLogger('MyPhotoApp.Core')
-import os, io
+logger = logging.getLogger("MyPhotoApp.Core")
+
+import os
+import io
 import mimetypes
 import hashlib
 import platform
 import shutil
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Dict, List
 
-# python-magic
+# python-magic (optional)
 try:
     import magic
 except ImportError:
     magic = None
 
-# Pillow + EXIF + perceptual hashing
+# Pillow / EXIF / perceptual hashing
 try:
-    from PIL import Image, ExifTags, ImageFile
-    ImageFile.LOAD_TRUNCATED_IMAGES = True
-
-
-    
+    from PIL import Image, ExifTags
     import imagehash
 except ImportError:
     Image = None
@@ -38,21 +36,18 @@ except ImportError:
 FileEntry = Dict[str, Any]
 
 # -------------------------------------------------------------------
-# ThreadPool para paralelizar tarefas internas por ficheiro
+# Thread pool
 # -------------------------------------------------------------------
 MAX_WORKERS = max(2, (os.cpu_count() // 2))
 executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
 
+
 # -------------------------------------------------------------------
-# Caminhos locais para ffmpeg/ffprobe
+# ffmpeg/ffprobe path helper
 # -------------------------------------------------------------------
 def _local_bin_path(name: str) -> str:
-    """
-    Devolve ./bin/<name> ou ./bin/<name>.exe consoante o SO.
-    """
     root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
     bin_dir = os.path.join(root, "bin")
-
     exe = name + ".exe" if platform.system() == "Windows" else name
     return os.path.join(bin_dir, exe)
 
@@ -92,8 +87,6 @@ def classify_mime(mime_type: str) -> Dict[str, bool]:
         "is_video": mime_type.startswith("video/"),
         "is_audio": mime_type.startswith("audio/"),
     }
-
-
 # -------------------------------------------------------------------
 # Filesystem metadata
 # -------------------------------------------------------------------
@@ -107,7 +100,7 @@ def get_fs_metadata(path: str) -> Dict[str, Any]:
     if birth:
         birth = datetime.fromtimestamp(birth).isoformat(timespec="seconds")
     else:
-        birth = created if platform.system() == "Windows" else created
+        birth = created
 
     return {
         "modified_date": modified,
@@ -158,36 +151,67 @@ def _parse_gps_info(gps_info):
 
     return la, lo
 
+
 def _safe_exif_value(v):
-    """
-    Converte valores EXIF (incluindo IFDRational) em tipos suportados por SQLite.
-    """
     if v is None:
         return None
-    # Objetos tipo IFDRational
     if hasattr(v, "numerator") and hasattr(v, "denominator"):
         try:
             return float(v.numerator) / float(v.denominator)
-        except Exception:
+        except:
             return str(v)
-    # Tuplos (ex: (1,2))
     if isinstance(v, tuple) and len(v) == 2:
         try:
             return float(v[0]) / float(v[1])
-        except Exception:
+        except:
             return str(v)
-    # Tipos já suportados
     if isinstance(v, (int, float, str)):
         return v
-    # Fallback seguro
     return str(v)
 
+
 # -------------------------------------------------------------------
-# IMAGE metadata
+# Image error classification (recommended rule set)
+# -------------------------------------------------------------------
+def _classify_image_error_message(msg: str) -> Dict[str, bool]:
+    msg = msg.lower()
+
+    soft = [
+        "image file is truncated",
+        "truncated",
+        "broken data stream",
+        "wrong number of bytes",
+        "incomplete jpeg",
+        "premature end of file",
+        "unexpected end of data",
+    ]
+
+    hard = [
+        "cannot identify image file",
+        "zlib.error",
+        "decoder error",
+        "invalid",
+        "missing soi",
+        "missing eoi",
+    ]
+
+    if any(s in msg for s in soft):
+        return {"is_corrupted": True, "is_usable": True}
+
+    if any(h in msg for h in hard):
+        return {"is_corrupted": True, "is_usable": False}
+
+    return {"is_corrupted": True, "is_usable": False}
+
+
+# -------------------------------------------------------------------
+# IMAGE METADATA (WITH VERIFY + EXT/FORMAT MISMATCH)
 # -------------------------------------------------------------------
 def extract_image_metadata(path: str, logger=None) -> Dict[str, Any]:
+
     data = {
-        "width": None, "height": None,
+        "width": None,
+        "height": None,
         "exif_datetime_original": None,
         "exif_camera_model": None,
         "exif_lens": None,
@@ -196,9 +220,16 @@ def extract_image_metadata(path: str, logger=None) -> Dict[str, Any]:
         "exif_fnumber": None,
         "exif_exposure_time": None,
         "exif_focal_length": None,
-        "gps_lat": None, "gps_lon": None,
-        "phash": None, "ahash": None, "dhash": None, "whash": None,
-        "brightness_mean": None, "hist_16bins": None,
+        "gps_lat": None,
+        "gps_lon": None,
+
+        "phash": None,
+        "ahash": None,
+        "dhash": None,
+        "whash": None,
+
+        "brightness_mean": None,
+        "hist_16bins": None,
 
         "is_corrupted": False,
         "is_usable": True,
@@ -208,59 +239,109 @@ def extract_image_metadata(path: str, logger=None) -> Dict[str, Any]:
     if not Image or not imagehash:
         return data
 
+    ext = os.path.splitext(path)[1].lower()
+    expected_format = {
+        ".png": "PNG",
+        ".jpg": "JPEG",
+        ".jpeg": "JPEG",
+        ".mpo": "MPO",
+        ".tif": "TIFF",
+        ".tiff": "TIFF",
+        ".bmp": "BMP",
+        ".gif": "GIF",
+        ".webp": "WEBP",
+    }
+
+    # ---------------------------
+    # 1) VERIFY STRUCTURE
+    # ---------------------------
+    soft_corruption = False
+    real_format = None
+
+    try:
+        with Image.open(path) as img_verify:
+            real_format = img_verify.format  # e.g. PNG, JPEG, MPO
+            img_verify.verify()
+    except Exception as e:
+        msg = str(e)
+        clas = _classify_image_error_message(msg)
+        data["is_corrupted"] = clas["is_corrupted"]
+        data["is_usable"] = clas["is_usable"]
+        data["read_error"] = msg
+
+        if data["is_usable"]:
+            soft_corruption = True
+            if logger:
+                logger.warning(f"Soft corruption (verify): {path} ({msg})")
+        else:
+            if logger:
+                logger.warning(f"Hard corruption (verify): {path} ({msg})")
+            return data
+
+    # ---------------------------
+    # 2) EXTENSION ↔ FORMAT mismatch
+    # ---------------------------
+    if ext in expected_format and real_format and expected_format[ext] != real_format:
+        data["is_corrupted"] = True
+        data["is_usable"] = True
+        data["read_error"] = f"Extension/format mismatch: ext={ext} format={real_format}"
+
+        if logger:
+            logger.warning(
+                f"Mismatched extension: {path} (ext={ext}, format={real_format})"
+            )
+
+        soft_corruption = True
+
+    # ---------------------------
+    # 3) LOAD and EXTRACT METADATA
+    # ---------------------------
     try:
         with Image.open(path) as img:
-            # Tenta carregar (pode lançar truncation, mas a imagem ainda ser útil)
             try:
                 img.load()
             except Exception as e:
-                msg = str(e).lower()
+                msg = str(e)
+                clas = _classify_image_error_message(msg)
+                data["is_corrupted"] = clas["is_corrupted"]
+                data["is_usable"] = clas["is_usable"]
 
-                if "truncated" in msg:
-                    data["is_corrupted"] = True
-                    data["is_usable"] = True
-                    data["read_error"] = str(e)
-                    if logger:
-                        logger.warning(f"Imagem truncada mas utilizável: {path} ({e})")
-                    # Continuamos — a imagem é usável
-                else:
-                    data["is_corrupted"] = True
-                    data["is_usable"] = False
-                    data["read_error"] = str(e)
-                    if logger:
-                        logger.warning(f"Erro ao ler imagem (unusable) {path}: {e}")
+                if not data["read_error"]:
+                    data["read_error"] = msg
+
+                if not data["is_usable"]:
                     return data
 
-            # IMAGEM É USÁVEL A PARTIR DAQUI
+                soft_corruption = True
+
             data["width"], data["height"] = img.size
 
-            # Perceptual hashes (falham = corrompida mas usável)
+            # HASHES
             try:
                 data["phash"] = str(imagehash.phash(img))
                 data["ahash"] = str(imagehash.average_hash(img))
                 data["dhash"] = str(imagehash.dhash(img))
                 data["whash"] = str(imagehash.whash(img))
             except Exception as e:
-                data["is_corrupted"] = True
-                data["read_error"] = str(e)
-                if logger:
-                    logger.debug(f"Perceptual hash falhou em {path}: {e}")
+                soft_corruption = True
+                if not data["read_error"]:
+                    data["read_error"] = str(e)
 
-            # Brightness / histogram
+            # BRIGHTNESS / HIST
             try:
                 gray = img.convert("L")
                 hist = gray.histogram()
                 total = sum(hist) or 1
-                brightness = sum(i * c for i, c in enumerate(hist)) / (255 * total)
-                data["brightness_mean"] = brightness
-                data["hist_16bins"] = [sum(hist[i*16:(i+1)*16]) for i in range(16)]
+                data["brightness_mean"] = sum(i * c for i, c in enumerate(hist)) / (
+                    255 * total
+                )
+                data["hist_16bins"] = [
+                    sum(hist[i * 16 : (i + 1) * 16]) for i in range(16)
+                ]
             except Exception as e:
-                data["is_corrupted"] = True
-                data["read_error"] = str(e)
-                if logger:
-                    logger.debug(f"Erro no histograma {path}: {e}")
+                soft_corruption = True
 
-            # EXIF extraction (falha = soft corruption)
+            # EXIF
             raw = getattr(img, "_getexif", lambda: None)()
             if raw:
                 exif = {ExifTags.TAGS.get(t, t): v for t, v in raw.items()}
@@ -271,9 +352,8 @@ def extract_image_metadata(path: str, logger=None) -> Dict[str, Any]:
                         data["exif_datetime_original"] = datetime.strptime(
                             dt, "%Y:%m:%d %H:%M:%S"
                         ).isoformat(timespec="seconds")
-                    except Exception:
-                        data["is_corrupted"] = True
-                        data["read_error"] = "Invalid EXIF datetime"
+                    except:
+                        soft_corruption = True
 
                 data["exif_camera_model"] = exif.get("Model")
                 data["exif_lens"] = exif.get("LensModel")
@@ -293,23 +373,20 @@ def extract_image_metadata(path: str, logger=None) -> Dict[str, Any]:
         data["is_corrupted"] = True
         data["is_usable"] = False
         data["read_error"] = str(e)
-        if logger:
-            logger.warning(f"Erro ao ler imagem (fatal) {path}: {e}")
+        return data
+
+    if soft_corruption:
+        data["is_corrupted"] = True
 
     return data
-
-
-
 # -------------------------------------------------------------------
-# Video metadata (ffprobe)
+# VIDEO METADATA
 # -------------------------------------------------------------------
 def find_ffprobe(logger=None):
-    # 1) PATH
     p = shutil.which("ffprobe")
     if p:
         return p
 
-    # 2) ./bin/ffprobe(.exe)
     local = _local_bin_path("ffprobe")
     if os.path.exists(local):
         return local
@@ -321,11 +398,15 @@ def find_ffprobe(logger=None):
 
 def extract_video_metadata(path: str, logger=None) -> Dict[str, Any]:
     data = {
-        "duration": None, "fps": None, "bitrate": None,
-        "nb_frames": None, "rotation": None,
-        "video_codec": None, "audio_codec": None,
-        "width": None, "height": None,
-
+        "duration": None,
+        "fps": None,
+        "bitrate": None,
+        "nb_frames": None,
+        "rotation": None,
+        "video_codec": None,
+        "audio_codec": None,
+        "width": None,
+        "height": None,
         "is_corrupted": False,
         "is_usable": True,
         "read_error": None,
@@ -348,11 +429,11 @@ def extract_video_metadata(path: str, logger=None) -> Dict[str, Any]:
         data["duration"] = float(fmt.get("duration")) if fmt.get("duration") else None
         data["bitrate"] = int(fmt.get("bit_rate")) if fmt.get("bit_rate") else None
 
-        usable_video_stream_found = False
+        usable_video_stream = False
 
         for stream in info.get("streams", []):
             if stream.get("codec_type") == "video":
-                usable_video_stream_found = True
+                usable_video_stream = True
 
                 data["video_codec"] = stream.get("codec_name")
                 data["width"] = stream.get("width")
@@ -363,9 +444,7 @@ def extract_video_metadata(path: str, logger=None) -> Dict[str, Any]:
                     n, d = fr.split("/")
                     data["fps"] = float(n) / float(d) if float(d) != 0 else None
 
-                data["nb_frames"] = (
-                    int(stream.get("nb_frames")) if stream.get("nb_frames") else None
-                )
+                data["nb_frames"] = int(stream.get("nb_frames")) if stream.get("nb_frames") else None
 
                 rot = stream.get("tags", {}).get("rotate")
                 data["rotation"] = int(rot) if rot else None
@@ -373,51 +452,49 @@ def extract_video_metadata(path: str, logger=None) -> Dict[str, Any]:
             if stream.get("codec_type") == "audio":
                 data["audio_codec"] = stream.get("codec_name")
 
-        # Se existe stream de vídeo → é usável mesmo que incompleto
-        if not usable_video_stream_found:
+        if not usable_video_stream:
             data["is_corrupted"] = True
             data["is_usable"] = False
             data["read_error"] = "No video stream"
+
         elif data["nb_frames"] is None or data["nb_frames"] == 0:
             data["is_corrupted"] = True
-            data["is_usable"] = True    # abre mas está incompleto
+            data["is_usable"] = True
             data["read_error"] = "Incomplete video stream"
 
     except Exception as e:
         data["is_corrupted"] = True
         data["is_usable"] = False
         data["read_error"] = str(e)
-        if logger:
-            logger.warning(f"Erro ao analisar vídeo (fatal) {path}: {e}")
 
     return data
 
 
-
 # -------------------------------------------------------------------
-# Frame extraction (ffmpeg)
+# FRAME EXTRACTION
 # -------------------------------------------------------------------
 def find_ffmpeg(logger=None):
-    # 1) PATH
     p = shutil.which("ffmpeg")
     if p:
         return p
 
-    # 2) ./bin/ffmpeg(.exe)
     local = _local_bin_path("ffmpeg")
     if os.path.exists(local):
         return local
 
     if logger:
-        logger.warning("ffmpeg não encontrado.")
+        logger.warning("ffmpeg not found.")
     return None
 
 
 def extract_video_frame_hashes(path: str, logger=None) -> Dict[str, Any]:
     data = {
-        "phash": None, "ahash": None, "dhash": None, "whash": None,
-        "brightness_mean": None, "hist_16bins": None,
-
+        "phash": None,
+        "ahash": None,
+        "dhash": None,
+        "whash": None,
+        "brightness_mean": None,
+        "hist_16bins": None,
         "is_corrupted": False,
         "is_usable": True,
         "read_error": None,
@@ -435,8 +512,7 @@ def extract_video_frame_hashes(path: str, logger=None) -> Dict[str, Any]:
 
     try:
         out, err = (
-            ffmpeg
-            .input(path, ss=0)
+            ffmpeg.input(path, ss=0)
             .output("pipe:", vframes=1, format="image2", vcodec="mjpeg")
             .run(cmd=cmd, capture_stdout=True, capture_stderr=True)
         )
@@ -450,7 +526,6 @@ def extract_video_frame_hashes(path: str, logger=None) -> Dict[str, Any]:
         img = Image.open(io.BytesIO(out))
         img.load()
 
-        # Hashes
         try:
             data["phash"] = str(imagehash.phash(img))
             data["ahash"] = str(imagehash.average_hash(img))
@@ -460,17 +535,13 @@ def extract_video_frame_hashes(path: str, logger=None) -> Dict[str, Any]:
             data["is_corrupted"] = True
             data["is_usable"] = True
             data["read_error"] = str(e)
-            if logger:
-                logger.debug(f"Erro ao calcular hash da frame em {path}: {e}")
 
-        # Brightness/histogram
         try:
             gray = img.convert("L")
             hist = gray.histogram()
             total = sum(hist) or 1
-            brightness = sum(i * c for i, c in enumerate(hist)) / (255 * total)
-            data["brightness_mean"] = brightness
-            data["hist_16bins"] = [sum(hist[i*16:(i+1)*16]) for i in range(16)]
+            data["brightness_mean"] = sum(i * c for i, c in enumerate(hist)) / (255 * total)
+            data["hist_16bins"] = [sum(hist[i * 16:(i + 1) * 16]) for i in range(16)]
         except:
             data["is_corrupted"] = True
             data["is_usable"] = True
@@ -479,18 +550,14 @@ def extract_video_frame_hashes(path: str, logger=None) -> Dict[str, Any]:
         data["is_corrupted"] = True
         data["is_usable"] = False
         data["read_error"] = str(e)
-        if logger:
-            logger.debug(f"Erro ao extrair frame de vídeo {path}: {e}")
 
     return data
 
 
-
 # -------------------------------------------------------------------
-# SCAN PRINCIPAL
+# SCAN DIRECTORY
 # -------------------------------------------------------------------
 def scan_directory(directory: str, callback=None, logger=None):
-
     results: List[FileEntry] = []
 
     if logger:
@@ -512,7 +579,10 @@ def scan_directory(directory: str, callback=None, logger=None):
 
             fut_img = fut_vid = fut_vid_frame = None
 
-            if kind["is_image"] and ext_lower != ".aae":
+            # Try processing images based on extension OR MIME
+            image_exts = {".png", ".jpg", ".jpeg", ".mpo", ".bmp", ".gif", ".tiff", ".tif", ".webp", ".heic", ".heif"}
+
+            if ext_lower in image_exts or kind["is_image"]:
                 fut_img = executor.submit(extract_image_metadata, full_path, logger)
 
             if kind["is_video"]:
@@ -548,7 +618,7 @@ def scan_directory(directory: str, callback=None, logger=None):
                 "size": os.path.getsize(full_path),
 
                 "mime_type": mime,
-                "is_image": kind["is_image"],
+                "is_image": bool(fut_img),
                 "is_video": kind["is_video"],
                 "is_audio": kind["is_audio"],
                 "is_aae": ext_lower == ".aae",
@@ -556,21 +626,17 @@ def scan_directory(directory: str, callback=None, logger=None):
 
                 "sha256": sha256,
 
-                # Hashes
                 "phash": img.get("phash") or vid_frame.get("phash"),
                 "ahash": img.get("ahash") or vid_frame.get("ahash"),
                 "dhash": img.get("dhash") or vid_frame.get("dhash"),
                 "whash": img.get("whash") or vid_frame.get("whash"),
 
-                # Dimensões
                 "width": img.get("width") or vid.get("width"),
                 "height": img.get("height") or vid.get("height"),
 
-                # Brightness & histogram
                 "brightness_mean": img.get("brightness_mean") or vid_frame.get("brightness_mean"),
                 "hist_16bins": img.get("hist_16bins") or vid_frame.get("hist_16bins"),
 
-                # Video metadata
                 "duration": vid.get("duration"),
                 "video_codec": vid.get("video_codec"),
                 "audio_codec": vid.get("audio_codec"),
@@ -579,7 +645,6 @@ def scan_directory(directory: str, callback=None, logger=None):
                 "nb_frames": vid.get("nb_frames"),
                 "rotation": vid.get("rotation"),
 
-                # EXIF
                 "exif_datetime_original": img.get("exif_datetime_original"),
                 "exif_camera_model": img.get("exif_camera_model"),
                 "exif_lens": img.get("exif_lens"),
@@ -589,26 +654,21 @@ def scan_directory(directory: str, callback=None, logger=None):
                 "exif_exposure_time": _safe_exif_value(img.get("exif_exposure_time")),
                 "exif_focal_length": _safe_exif_value(img.get("exif_focal_length")),
 
-                # GPS
                 "gps_lat": img.get("gps_lat"),
                 "gps_lon": img.get("gps_lon"),
 
-                # Datas
                 "created_date": created,
                 "modified_date": modified,
                 "year": year,
                 "month": month,
 
-                # FS metadata
                 "fs_created_date": fs_meta["fs_created_date"],
                 "birth_date": fs_meta["birth_date"],
                 "inode": fs_meta["inode"],
 
-                # Estado
                 "is_corrupted": bool(img.get("is_corrupted") or vid.get("is_corrupted")),
+                "is_usable": img.get("is_usable", True) if fut_img else vid.get("is_usable", True),
                 "read_error": img.get("read_error") or vid.get("read_error"),
-                "is_usable": img.get("is_usable", True),
-
 
                 "tags": [],
                 "notes": "",
